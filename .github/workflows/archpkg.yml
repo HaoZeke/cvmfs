@@ -20,7 +20,7 @@ jobs:
           pacman -Syu --noconfirm --needed base-devel git fuse3 fuse2 curl c-ares pacparser sqlite leveldb cmake gtest sparsehash help2man python protobuf libcap util-linux-libs openssl zlib attr valgrind
           useradd -m builder
           cp -r ci-archpkg /home/builder/pkg
-          git -C src-fixes archive --prefix=cvmfs-passthrough-fixes/ -o /home/builder/pkg/cvmfs-passthrough-fixes.tar.gz HEAD
+          mv src-fixes cvmfs-passthrough-fixes && tar czf /home/builder/pkg/cvmfs-passthrough-fixes.tar.gz cvmfs-passthrough-fixes
           chown -R builder /home/builder/pkg
       - name: makepkg
         run: |
