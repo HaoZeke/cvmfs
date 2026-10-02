@@ -6,6 +6,7 @@
 #define CVMFS_MONITOR_H_
 
 #include <pthread.h>
+#include <stdint.h>
 #include <signal.h>
 #include <sys/types.h>
 #include <unistd.h>
@@ -28,11 +29,12 @@ class WatchdogState {
 
  public:
   WatchdogState()
-      : version(0)
+      : version(1)
       , watchdog_write_fd(-1)
       , listener_read_fd(-1)
       , spawned(false)
-      , pid(0) { }
+      , pid(0)
+      , broker_fd(-1) { }
 
  private:
   unsigned version;
@@ -40,6 +42,10 @@ class WatchdogState {
   int listener_read_fd;
   bool spawned;
   pid_t pid;
+  /**
+   * Client end of the backing-file broker socket (version >= 1)
+   */
+  int broker_fd;
 };
 
 
@@ -71,6 +77,26 @@ class Watchdog : SingleCopy {
   void ClearOnExitFn() { on_exit_ = NULL; }
   void EnterMaintenanceMode() { maintenance_mode_ = true; }
   void SaveState(WatchdogState *state);
+
+  /**
+   * FUSE passthrough needs CAP_SYS_ADMIN for registering backing files, which
+   * the client no longer has (#3730) but the watchdog of the FUSE module keeps
+   * for the unmount.  The client hands the watchdog the /dev/fuse descriptor
+   * once and then each backing file; the watchdog issues the ioctl.
+   */
+  bool HasBroker() const { return broker_fd_ >= 0; }
+  /**
+   * Returns 0 or -errno.
+   */
+  int BrokerSetFuseDevice(int fuse_fd);
+  /**
+   * Returns the backing id (> 0) or -errno.
+   */
+  int BrokerBackingOpen(int fd);
+  /**
+   * Returns 0 or -errno.
+   */
+  int BrokerBackingClose(int backing_id);
 
   /**
    * Signals that watchdog should not receive. If it does, report and exit.
@@ -115,6 +141,18 @@ class Watchdog : SingleCopy {
   static Watchdog *Me() { return instance_; }
 
   static void *MainWatchdogListener(void *data);
+  static void *MainBackingBroker(void *data);
+
+  struct BrokerRequest {
+    enum Op {
+      kSetFuseDevice = 1,
+      kBackingOpen,
+      kBackingClose,
+    };
+    int32_t op;
+    int32_t arg;
+  };
+  int BrokerCall(int32_t op, int32_t arg, int fd);
 
   static void ReportSignalAndContinue(int sig, siginfo_t *siginfo,
                                       void *context);
@@ -142,6 +180,11 @@ class Watchdog : SingleCopy {
   /// Send the terminate signal to the listener
   std::unique_ptr<Pipe<kPipeThreadTerminator> > pipe_terminate_;
   pthread_t thread_listener_;
+  /// Client end of the backing-file broker socket, -1 if there is none
+  int broker_fd_;
+  /// Watchdog end, valid only in the watchdog process
+  int broker_peer_fd_;
+  pthread_mutex_t lock_broker_;
   FnOnExit on_exit_;
   platform_spinlock lock_handler_;
   stack_t sighandler_stack_;

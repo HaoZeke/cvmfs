@@ -17,6 +17,8 @@
 #include <pthread.h>
 #include <signal.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/types.h>
 #ifdef __APPLE__
 #include <sys/ucontext.h>
@@ -28,6 +30,12 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__linux__) && defined(__has_include)
+#if __has_include(<linux/fuse.h>)
+#include <linux/fuse.h>
+#include <sys/ioctl.h>
+#endif
+#endif
 
 #include <cassert>
 #include <cstdio>
@@ -392,6 +400,20 @@ Watchdog::SigactionMap Watchdog::SetSignalHandlers(
  */
 void Watchdog::Fork(bool needs_read_environ) {
   Pipe<kPipeWatchdogPid> pipe_pid;
+#ifdef FUSE_DEV_IOC_BACKING_OPEN
+  // Only the watchdog of the FUSE module (the one that unmounts) keeps
+  // CAP_SYS_ADMIN, so only it can broker passthrough backing files.
+  if (on_exit_) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) == 0) {
+      broker_fd_ = sv[0];
+      broker_peer_fd_ = sv[1];
+    } else {
+      LogCvmfs(kLogMonitor, kLogDebug | kLogSyslogWarn,
+               "no passthrough broker, socketpair failed (%d)", errno);
+    }
+  }
+#endif
   pipe_watchdog_ = std::unique_ptr<Pipe<kPipeWatchdog> >(
       new Pipe<kPipeWatchdog>());
   pipe_listener_ = std::unique_ptr<Pipe<kPipeWatchdogSupervisor> >(
@@ -409,6 +431,10 @@ void Watchdog::Fork(bool needs_read_environ) {
           _exit(1);
         case 0: {
           pipe_watchdog_->CloseWriteFd();
+          if (broker_fd_ >= 0) {
+            close(broker_fd_);
+            broker_fd_ = -1;
+          }
           Daemonize();
           if ((geteuid() != 0) && SetuidCapabilityPermitted()) {
             const std::vector<cap_value_t> nocaps;
@@ -465,9 +491,22 @@ void Watchdog::Fork(bool needs_read_environ) {
           preserve_fds.insert(2);
           preserve_fds.insert(pipe_watchdog_->GetReadFd());
           preserve_fds.insert(pipe_listener_->GetWriteFd());
+          if (broker_peer_fd_ >= 0)
+            preserve_fds.insert(broker_peer_fd_);
           CloseAllFildes(preserve_fds);
           SetLogMicroSyslog(usyslog_save);  // no-op if usyslog not used
           SetLogDebugFile(debuglog_save);   // no-op if debug log not used
+
+          if (broker_peer_fd_ >= 0) {
+            pthread_t thread_broker;
+            if (pthread_create(&thread_broker, NULL, MainBackingBroker, this)
+                == 0) {
+              pthread_detach(thread_broker);
+            } else {
+              close(broker_peer_fd_);
+              broker_peer_fd_ = -1;
+            }
+          }
 
           if (WaitForSupervisee())
             Supervise();
@@ -483,6 +522,10 @@ void Watchdog::Fork(bool needs_read_environ) {
       pipe_watchdog_->CloseReadFd();
       pipe_listener_->CloseWriteFd();
       pipe_pid.CloseWriteFd();
+      if (broker_peer_fd_ >= 0) {
+        close(broker_peer_fd_);
+        broker_peer_fd_ = -1;
+      }
       if (waitpid(pid, &statloc, 0) != pid)
         PANIC(NULL);
       if (!WIFEXITED(statloc) || WEXITSTATUS(statloc))
@@ -699,6 +742,7 @@ void Watchdog::SaveState(WatchdogState *saved_state) {
     saved_state->watchdog_write_fd = pipe_watchdog_->GetWriteFd();
     saved_state->listener_read_fd = pipe_listener_->GetReadFd();
   }
+  saved_state->broker_fd = broker_fd_;
 }
 
 
@@ -707,6 +751,8 @@ void Watchdog::SaveState(WatchdogState *saved_state) {
  */
 void Watchdog::RestoreState(WatchdogState *saved_state) {
   watchdog_pid_ = saved_state->pid;
+  if (saved_state->version >= 1)
+    broker_fd_ = saved_state->broker_fd;
   if (!saved_state->spawned) {
     return;
   }
@@ -718,14 +764,214 @@ void Watchdog::RestoreState(WatchdogState *saved_state) {
 }
 
 
+namespace {
+
+/**
+ * Sends one broker message, with fd attached as SCM_RIGHTS when fd >= 0.
+ */
+bool BrokerSend(int sock, const void *buf, size_t size, int fd) {
+  struct iovec iov;
+  iov.iov_base = const_cast<void *>(buf);
+  iov.iov_len = size;
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  char cmsg_buf[CMSG_SPACE(sizeof(int))];
+  if (fd >= 0) {
+    memset(cmsg_buf, 0, sizeof(cmsg_buf));
+    msg.msg_control = cmsg_buf;
+    msg.msg_controllen = sizeof(cmsg_buf);
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+  }
+  ssize_t n;
+  do {
+    n = sendmsg(sock, &msg, MSG_NOSIGNAL);
+  } while ((n < 0) && (errno == EINTR));
+  return n == static_cast<ssize_t>(size);
+}
+
+/**
+ * Receives one broker message; *fd is the attached descriptor or -1.
+ * Returns the number of bytes, 0 when the peer closed, -1 on error.
+ */
+ssize_t BrokerRecv(int sock, void *buf, size_t size, int *fd) {
+  *fd = -1;
+  struct iovec iov;
+  iov.iov_base = buf;
+  iov.iov_len = size;
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  char cmsg_buf[CMSG_SPACE(sizeof(int))];
+  msg.msg_control = cmsg_buf;
+  msg.msg_controllen = sizeof(cmsg_buf);
+  ssize_t n;
+  do {
+    n = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
+  } while ((n < 0) && (errno == EINTR));
+  if (n <= 0)
+    return n;
+  for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
+       cmsg = CMSG_NXTHDR(&msg, cmsg))
+  {
+    if ((cmsg->cmsg_level == SOL_SOCKET) && (cmsg->cmsg_type == SCM_RIGHTS))
+      memcpy(fd, CMSG_DATA(cmsg), sizeof(int));
+  }
+  return n;
+}
+
+}  // anonymous namespace
+
+
+/**
+ * Client side: one request, one reply, serialized across FUSE threads.
+ */
+int Watchdog::BrokerCall(int32_t op, int32_t arg, int fd) {
+  if (broker_fd_ < 0)
+    return -ENOSYS;
+  BrokerRequest request;
+  request.op = op;
+  request.arg = arg;
+  int32_t reply = -EIO;
+  pthread_mutex_lock(&lock_broker_);
+  if (!BrokerSend(broker_fd_, &request, sizeof(request), fd)) {
+    reply = -errno;
+  } else {
+    int unused_fd;
+    const ssize_t n = BrokerRecv(broker_fd_, &reply, sizeof(reply),
+                                 &unused_fd);
+    if (unused_fd >= 0)
+      close(unused_fd);
+    if (n != static_cast<ssize_t>(sizeof(reply)))
+      reply = (n == 0) ? -EPIPE : -errno;
+  }
+  pthread_mutex_unlock(&lock_broker_);
+  return reply;
+}
+
+int Watchdog::BrokerSetFuseDevice(int fuse_fd) {
+  return BrokerCall(BrokerRequest::kSetFuseDevice, 0, fuse_fd);
+}
+
+int Watchdog::BrokerBackingOpen(int fd) {
+  return BrokerCall(BrokerRequest::kBackingOpen, 0, fd);
+}
+
+int Watchdog::BrokerBackingClose(int backing_id) {
+  return BrokerCall(BrokerRequest::kBackingClose, backing_id, -1);
+}
+
+
+/**
+ * Watchdog side: registers and releases FUSE passthrough backing files for the
+ * client.  The watchdog keeps CAP_SYS_ADMIN permitted for the unmount; this
+ * thread raises it only around the two ioctls.
+ */
+void *Watchdog::MainBackingBroker(void *data) {
+  Watchdog *watchdog = static_cast<Watchdog *>(data);
+  const int sock = watchdog->broker_peer_fd_;
+  int fuse_fd = -1;
+  while (true) {
+    BrokerRequest request;
+    int fd;
+    const ssize_t n = BrokerRecv(sock, &request, sizeof(request), &fd);
+    if (n <= 0)
+      break;
+    int32_t reply = -EINVAL;
+    if (n != static_cast<ssize_t>(sizeof(request))) {
+      if (fd >= 0)
+        close(fd);
+      BrokerSend(sock, &reply, sizeof(reply), -1);
+      continue;
+    }
+    switch (request.op) {
+      case BrokerRequest::kSetFuseDevice:
+        if (fd < 0) {
+          reply = -EBADF;
+        } else {
+          if (fuse_fd >= 0)
+            close(fuse_fd);
+          fuse_fd = fd;
+          fd = -1;
+          reply = 0;
+        }
+        break;
+#ifdef FUSE_DEV_IOC_BACKING_OPEN
+      case BrokerRequest::kBackingOpen: {
+        platform_stat64 info;
+        if (fuse_fd < 0) {
+          reply = -ENODEV;
+        } else if ((fd < 0) || (platform_fstat(fd, &info) != 0)) {
+          reply = -EBADF;
+        } else if (!S_ISREG(info.st_mode)) {
+          reply = -EINVAL;
+        } else {
+          struct fuse_backing_map map;
+          memset(&map, 0, sizeof(map));
+          map.fd = fd;
+          const bool raise = !SysAdminCapabilityEffective();
+          if (raise)
+            ObtainSysAdminCapability();
+          const int retval = ioctl(fuse_fd, FUSE_DEV_IOC_BACKING_OPEN, &map);
+          const int ioctl_errno = errno;
+          if (raise && !DropSysAdminCapability())
+            PANIC(kLogSyslogErr, "passthrough broker: cannot drop "
+                                 "CAP_SYS_ADMIN");
+          reply = (retval > 0) ? retval : -ioctl_errno;
+        }
+        break;
+      }
+      case BrokerRequest::kBackingClose: {
+        if (fuse_fd < 0) {
+          reply = -ENODEV;
+        } else {
+          uint32_t backing_id = static_cast<uint32_t>(request.arg);
+          const bool raise = !SysAdminCapabilityEffective();
+          if (raise)
+            ObtainSysAdminCapability();
+          const int retval = ioctl(fuse_fd, FUSE_DEV_IOC_BACKING_CLOSE,
+                                   &backing_id);
+          const int ioctl_errno = errno;
+          if (raise && !DropSysAdminCapability())
+            PANIC(kLogSyslogErr, "passthrough broker: cannot drop "
+                                 "CAP_SYS_ADMIN");
+          reply = (retval == 0) ? 0 : -ioctl_errno;
+        }
+        break;
+      }
+#endif
+      default:
+        reply = -EINVAL;
+    }
+    if (fd >= 0)
+      close(fd);
+    BrokerSend(sock, &reply, sizeof(reply), -1);
+  }
+  if (fuse_fd >= 0)
+    close(fuse_fd);
+  close(sock);
+  return NULL;
+}
+
+
 Watchdog::Watchdog(FnOnExit on_exit)
     : spawned_(false)
     , maintenance_mode_(false)
     , exe_path_(string(platform_getexepath()))
     , watchdog_pid_(0)
+    , broker_fd_(-1)
+    , broker_peer_fd_(-1)
     , on_exit_(on_exit) {
   const int retval = platform_spinlock_init(&lock_handler_, 0);
   assert(retval == 0);
+  const int retval_mutex = pthread_mutex_init(&lock_broker_, NULL);
+  assert(retval_mutex == 0);
   memset(&sighandler_stack_, 0, sizeof(sighandler_stack_));
 }
 
@@ -759,6 +1005,8 @@ Watchdog::~Watchdog() {
     }
     pipe_watchdog_->CloseWriteFd();
     pipe_listener_->CloseReadFd();
+    if (broker_fd_ >= 0)
+      close(broker_fd_);
   } else {
     // Release the references to the watchdog pipes without closing them
     pipe_watchdog_.release();
@@ -766,6 +1014,7 @@ Watchdog::~Watchdog() {
   }
 
   platform_spinlock_destroy(&lock_handler_);
+  pthread_mutex_destroy(&lock_broker_);
   LogCvmfs(kLogMonitor, kLogDebug, "monitor stopped");
   instance_ = NULL;
 }
