@@ -133,6 +133,8 @@ InodeGenerationInfo inode_generation_info_;
 typedef struct fuse_passthru_ctx {
   int backing_id;
   int refcount;
+  /**< registered by the watchdog's broker rather than by this process */
+  bool via_broker;
 } fuse_passthru_ctx_t;
 static std::unordered_map<fuse_ino_t, fuse_passthru_ctx_t>
     *fuse_passthru_tracker = NULL;
@@ -140,6 +142,50 @@ pthread_mutex_t fuse_passthru_tracker_lock = PTHREAD_MUTEX_INITIALIZER;
 // Set once the kernel refuses a backing file with EPERM; no further ones are
 // requested. Guarded by fuse_passthru_tracker_lock.
 static bool fuse_passthru_refused = false;
+// Set once the watchdog's broker holds this connection's /dev/fuse descriptor.
+// Guarded by fuse_passthru_tracker_lock.
+static bool fuse_passthru_broker_ready = false;
+
+/**
+ * Registers fd as a passthrough backing file.  Without CAP_SYS_ADMIN (#3730)
+ * the kernel refuses this process, so the watchdog, which keeps it for the
+ * unmount, registers it when it can.  Returns the backing id, or 0 with errno
+ * set.  Called with fuse_passthru_tracker_lock held.
+ */
+static int PassthroughBackingOpen(fuse_req_t req, int fd, bool *via_broker) {
+  *via_broker = false;
+  if (watchdog_ && watchdog_->HasBroker()) {
+    if (!fuse_passthru_broker_ready && loader_exports_
+        && loader_exports_->fuse_session)
+    {
+      const int fuse_fd = fuse_session_fd(*loader_exports_->fuse_session);
+      const int retval = watchdog_->BrokerSetFuseDevice(fuse_fd);
+      fuse_passthru_broker_ready = (retval == 0);
+      LogCvmfs(kLogCvmfs, kLogDebug | (retval == 0 ? 0 : kLogSyslogWarn),
+               "FUSE: passthrough broker %s (%d)",
+               retval == 0 ? "ready" : "unavailable", retval);
+    }
+    if (fuse_passthru_broker_ready) {
+      const int retval = watchdog_->BrokerBackingOpen(fd);
+      if (retval > 0) {
+        *via_broker = true;
+        return retval;
+      }
+      errno = -retval;
+      return 0;
+    }
+  }
+  errno = 0;
+  return fuse_passthrough_open(req, fd);
+}
+
+static int PassthroughBackingClose(fuse_req_t req,
+                                   const fuse_passthru_ctx_t &entry)
+{
+  if (entry.via_broker && watchdog_)
+    return watchdog_->BrokerBackingClose(entry.backing_id);
+  return fuse_passthrough_close(req, entry.backing_id);
+}
 #endif
 
 /**
@@ -1382,9 +1428,9 @@ static void cvmfs_open(fuse_req_t req, fuse_ino_t ino,
              * Such a file is served through the regular read path, and after
              * an EPERM no further backing files are requested. */
             backing_id = 0;
+            bool via_broker = false;
             if (!fuse_passthru_refused) {
-              errno = 0;
-              backing_id = fuse_passthrough_open(req, fd);
+              backing_id = PassthroughBackingOpen(req, fd, &via_broker);
               const int open_errno = errno;
               if (backing_id <= 0 && open_errno == EPERM) {
                 fuse_passthru_refused = true;
@@ -1404,6 +1450,7 @@ static void cvmfs_open(fuse_req_t req, fuse_ino_t ino,
               assert(pair_with_iterator.second == true);
               fuse_passthru_ctx_t &entry = pair_with_iterator.first->second;
               entry.backing_id = backing_id;
+              entry.via_broker = via_broker;
               entry.refcount++;
             }
           } else {
@@ -1735,7 +1782,7 @@ static void cvmfs_release(fuse_req_t req, fuse_ino_t ino,
         assert(entry.refcount > 0);
         entry.refcount--;
         if (entry.refcount == 0) {
-          const int ret = fuse_passthrough_close(req, entry.backing_id);
+          const int ret = PassthroughBackingClose(req, entry);
           if (ret < 0) {
             LogCvmfs(kLogCvmfs, kLogDebug | kLogSyslogWarn,
                      "fuse_passthrough_close(backing_id=%d) failed: %d",
