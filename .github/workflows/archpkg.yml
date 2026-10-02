@@ -72,6 +72,7 @@ jobs:
           if [ "${{ matrix.tree }}" = devel-with-new-tests ]; then
             # stock devel code, this branch's tests and libfuse stubs
             git checkout -q FETCH_HEAD -- cvmfs
+            sed -i '/cvmfs::fuse_passthru_refused = false;/d' test/unittests/t_cvmfs.cc
           fi
           git log --oneline -1
       - name: build the mockfuse unit tests
@@ -82,4 +83,10 @@ jobs:
       - name: run T_Cvmfs*
         run: |
           cd src/build
-          ./test/unittests/cvmfs_unittests_mockfuse --gtest_filter='T_Cvmfs*' 2>&1 | tail -40
+          set +e
+          ./test/unittests/cvmfs_unittests_mockfuse --gtest_filter='T_Cvmfs.*' 2>&1 | tail -5
+          for t in RefusedBackingOpenServesWithoutPassthrough ReleaseClosesBackingFileOnLastReference; do
+            echo "=== T_CvmfsPassthrough.$t"
+            ./test/unittests/cvmfs_unittests_mockfuse --gtest_filter="T_CvmfsPassthrough.$t" 2>&1 | grep -E 'OK \]|FAILED|Failure|Expected|Which is|actual|Assertion|Aborted' | head -12
+            echo "exit ${PIPESTATUS[0]}"
+          done
