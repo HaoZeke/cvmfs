@@ -51,6 +51,10 @@ bool CheckCapabilityPermitted(const cap_value_t) {
   return (getuid() == 0);
 }
 
+bool CheckCapabilityEffective(const cap_value_t) {
+  return (geteuid() == 0);
+}
+
 bool DropCapability(const cap_value_t,
                     const char *,
                     const bool avoid_mutexes = false) {
@@ -291,6 +295,24 @@ bool CheckCapabilityPermitted(const cap_value_t cap) {
   return (cap_state == CAP_SET);
 }
 
+bool CheckCapabilityEffective(const cap_value_t cap) {
+  cap_t caps_proc = cap_get_proc();
+  if (caps_proc == NULL)
+    PANIC(kLogSyslogErr | kLogDebug,
+          "Cannot get process capabilities (errno: %d)", errno);
+  cap_flag_value_t cap_state;
+  const int retval = cap_get_flag(caps_proc,
+                                  cap,
+                                  CAP_EFFECTIVE,
+                                  &cap_state);
+  cap_free(caps_proc);
+  if (retval != 0)
+    PANIC(kLogSyslogErr | kLogDebug,
+          "Cannot inspect effective capability 0x%x (errno: %d)", cap,
+          errno);
+  return (cap_state == CAP_SET);
+}
+
 } // namespace
 
 #endif // __APPLE__
@@ -305,6 +327,14 @@ bool DropDacReadSearchCapability() {
 
 bool ObtainSysAdminCapability() {
   return ObtainCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN");
+}
+
+bool DropSysAdminCapability() {
+  return DropCapability(CAP_SYS_ADMIN, "CAP_SYS_ADMIN");
+}
+
+bool SysAdminCapabilityEffective() {
+  return CheckCapabilityEffective(CAP_SYS_ADMIN);
 }
 
 bool ObtainSysPtraceCapability() {

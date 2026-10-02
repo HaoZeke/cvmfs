@@ -28,6 +28,8 @@ namespace CVMFS_NAMESPACE_GUARD {
 CVMFS_EXPORT bool ObtainDacReadSearchCapability();
 CVMFS_EXPORT bool DropDacReadSearchCapability();
 CVMFS_EXPORT bool ObtainSysAdminCapability();
+CVMFS_EXPORT bool DropSysAdminCapability();
+CVMFS_EXPORT bool SysAdminCapabilityEffective();
 CVMFS_EXPORT bool ObtainSysPtraceCapability();
 CVMFS_EXPORT bool DropSysPtraceCapability();
 CVMFS_EXPORT bool ObtainSetuidgidCapabilities(const bool avoid_mutexes = false);
