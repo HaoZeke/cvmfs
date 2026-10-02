@@ -9,11 +9,16 @@ jobs:
     runs-on: ubuntu-24.04
     container: archlinux:latest
     timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      matrix:
+        src: [passthrough-fixes, devel]
     steps:
       - uses: actions/checkout@v4
       - uses: actions/checkout@v4
         with:
-          ref: passthrough-fixes
+          repository: ${{ matrix.src == 'devel' && 'cvmfs/cvmfs' || github.repository }}
+          ref: ${{ matrix.src }}
           path: src-fixes
       - name: toolchain and dependencies
         run: |
@@ -30,7 +35,7 @@ jobs:
           pacman -Q curl fuse3 > versions.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: cvmfs-devel-passthrough-fixes
+          name: cvmfs-${{ matrix.src }}
           path: |
             /home/builder/pkg/*.pkg.tar.zst
             /home/builder/pkg/versions.txt
