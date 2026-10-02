@@ -1,7 +1,7 @@
 From 5cfe0f8a7d019d6fc526a54ca8831c7a1777cde8 Mon Sep 17 00:00:00 2001
 From: Rohit Goswami <rohit.goswami@surf.nl>
 Date: Fri, 2 Oct 2026 16:17:58 +0200
-Subject: [PATCH 1/4] Add DropSysAdminCapability and
+Subject: [PATCH 1/5] Add DropSysAdminCapability and
  SysAdminCapabilityEffective
 
 ---
@@ -84,7 +84,7 @@ index 41e198548..174fdd11e 100644
 From 8804111d55533352fc0c7e086472dfd6916f1f1b Mon Sep 17 00:00:00 2001
 From: Rohit Goswami <rohit.goswami@surf.nl>
 Date: Fri, 2 Oct 2026 16:18:48 +0200
-Subject: [PATCH 2/4] Keep FUSE passthrough working after the capability
+Subject: [PATCH 2/5] Keep FUSE passthrough working after the capability
  reduction
 
 Since the client reduces its capabilities to the minimum (#3730), a
@@ -202,7 +202,7 @@ index 8789ccd7a..a1b9868de 100644
 From 190431c0816a7afffa2f4b6f55430d7f94ec3d36 Mon Sep 17 00:00:00 2001
 From: Rohit Goswami <rohit.goswami@surf.nl>
 Date: Fri, 2 Oct 2026 16:19:09 +0200
-Subject: [PATCH 3/4] Close FUSE passthrough backing files on release
+Subject: [PATCH 3/5] Close FUSE passthrough backing files on release
 
 libfuse rebuilds fuse_file_info for release from the release request
 (flags, fh, lock owner) and never sets backing_id, so cvmfs_release()
@@ -276,7 +276,7 @@ index a1b9868de..d21071a62 100644
 From 21ecf55831a3e8bfaf6939ee6a6db92d9be67c48 Mon Sep 17 00:00:00 2001
 From: Rohit Goswami <rohit.goswami@surf.nl>
 Date: Fri, 2 Oct 2026 16:29:20 +0200
-Subject: [PATCH 4/4] capabilities: use the 2.14 assert style in
+Subject: [PATCH 4/5] capabilities: use the 2.14 assert style in
  CheckCapabilityEffective
 
 ---
@@ -309,6 +309,33 @@ index 19424f980..d4906c69d 100644
    return (cap_state == CAP_SET);
  }
  
+-- 
+2.55.0
+
+
+From e3c8fc6284b02ee4344a23a8152f65452fda2ae1 Mon Sep 17 00:00:00 2001
+From: Rohit Goswami <rohit.goswami@surf.nl>
+Date: Fri, 2 Oct 2026 16:35:31 +0200
+Subject: [PATCH 5/5] fixup! Keep FUSE passthrough working after the capability
+ reduction
+
+---
+ cvmfs/cvmfs.cc | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/cvmfs/cvmfs.cc b/cvmfs/cvmfs.cc
+index d21071a62..abb46a259 100644
+--- a/cvmfs/cvmfs.cc
++++ b/cvmfs/cvmfs.cc
+@@ -2669,7 +2669,7 @@ static void Spawn() {
+       reservecaps.push_back(CAP_DAC_READ_SEARCH);
+       reservecaps.push_back(CAP_SYS_PTRACE);
+     }
+-    if (loader_exports_ && loader_exports_->fuse_passthrough) {
++    if (cvmfs::loader_exports_ && cvmfs::loader_exports_->fuse_passthrough) {
+       // The kernel opens FUSE passthrough backing files only for a daemon
+       // with CAP_SYS_ADMIN (FUSE_DEV_IOC_BACKING_OPEN and _CLOSE)
+       reservecaps.push_back(CAP_SYS_ADMIN);
 -- 
 2.55.0
 

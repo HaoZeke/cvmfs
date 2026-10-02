@@ -40,5 +40,5 @@ jobs:
         run: pacman -Syu --noconfirm --needed base-devel git fuse3 fuse2 curl c-ares pacparser sqlite leveldb cmake gtest sparsehash help2man python protobuf libcap util-linux-libs openssl zlib attr
       - name: configure and build the client
         run: |
-          cmake -S . -B build -DBUILD_SERVER=OFF -DBUILD_RECEIVER=OFF -DBUILD_LIBCVMFS=OFF -DBUILD_LIBCVMFS_CACHE=OFF -DBUILD_SHRINKWRAP=OFF -DBUILD_GATEWAY=OFF -DBUILD_DUCC=OFF -DBUILD_SNAPSHOTTER=OFF -DBUILD_UNITTESTS=OFF -DBUILTIN_EXTERNALS_LIST="libcrypto;sha3"
+          cmake -S . -B build -DBUILD_SERVER=OFF -DBUILD_RECEIVER=OFF -DBUILD_LIBCVMFS=OFF -DBUILD_LIBCVMFS_CACHE=OFF -DBUILD_SHRINKWRAP=OFF -DBUILD_GATEWAY=OFF -DBUILD_DUCC=OFF -DBUILD_SNAPSHOTTER=OFF -DBUILD_UNITTESTS=OFF -DBUILTIN_EXTERNALS_LIST="libcrypto"
           cmake --build build -j"$(nproc)"
