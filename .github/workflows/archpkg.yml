@@ -1,4 +1,4 @@
-name: arch package 2.14.1 + passthrough fixes
+name: arch package of devel + passthrough fixes
 on:
   push:
     branches: [ci/archpkg]
@@ -11,11 +11,17 @@ jobs:
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+        with:
+          ref: passthrough-fixes
+          path: src-fixes
       - name: toolchain and dependencies
         run: |
           pacman -Syu --noconfirm --needed base-devel git fuse3 fuse2 curl c-ares pacparser sqlite leveldb cmake gtest sparsehash help2man python protobuf libcap util-linux-libs openssl zlib attr valgrind
           useradd -m builder
-          cp -r ci-archpkg /home/builder/pkg && chown -R builder /home/builder/pkg
+          cp -r ci-archpkg /home/builder/pkg
+          git -C src-fixes archive --prefix=cvmfs-passthrough-fixes/ -o /home/builder/pkg/cvmfs-passthrough-fixes.tar.gz HEAD
+          chown -R builder /home/builder/pkg
       - name: makepkg
         run: |
           cd /home/builder/pkg
@@ -24,7 +30,7 @@ jobs:
           pacman -Q curl fuse3 > versions.txt
       - uses: actions/upload-artifact@v4
         with:
-          name: cvmfs-2.14.1-4
+          name: cvmfs-devel-passthrough-fixes
           path: |
             /home/builder/pkg/*.pkg.tar.zst
             /home/builder/pkg/versions.txt
@@ -35,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: fix/passthrough-eperm-fallback
+          ref: passthrough-fixes
       - name: dependencies
         run: pacman -Syu --noconfirm --needed base-devel git fuse3 fuse2 curl c-ares pacparser sqlite leveldb cmake gtest sparsehash help2man python protobuf libcap util-linux-libs openssl zlib attr
       - name: configure and build the client

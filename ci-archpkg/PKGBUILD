@@ -5,8 +5,8 @@
 # Contributor: Lin Further
 # Contributor: vavolkl
 pkgname=cvmfs
-pkgver=2.14.1
-pkgrel=4
+pkgver=2.15.0_devel.cc9730e98
+pkgrel=1
 pkgdesc="A client-server file system implemented in FUSE and developed to deliver software distributions onto virtual machines in a fast, scalable, and reliable way."
 arch=('x86_64')
 url="http://cernvm.cern.ch/portal/filesystem"
@@ -16,25 +16,18 @@ makedepends=('cmake' 'make' 'gtest' 'sparsehash' 'help2man')
 backup=('etc/cvmfs/default.local')
 install=cvmfs.install
 options=('!emptydirs')
-source=("https://github.com/cvmfs/cvmfs/archive/refs/tags/$pkgname-$pkgver.tar.gz"
+source=("cvmfs-passthrough-fixes.tar.gz"
         'settings.cmake'
-        'cvmfs-2.14.1-passthrough.patch' # TODO: use libcrypto from system openssl instead of building libressl here?
        )
-md5sums=('f2fe8673a4b05e2e931a780fa9254525'
-         '4e7a9a38b3cb0fc95d83fa0456071f2b'
-         'd445c160710260df6aff8f390c105f65')
+md5sums=('SKIP' 'SKIP')
 
 prepare() {
-    #Temporary pull patch for a race condition occasionally
-    #breaking the man page generation
-    #https://github.com/cvmfs/cvmfs/pull/4075
-    #!!TO BE REMOVED FOR THE NEXT OFFICIAL RELEASE!!
-    patch -d $pkgname-$pkgname-$pkgver -Np1 -i ../cvmfs-2.14.1-passthrough.patch
+    true
 }
 
 build() {
     # github tarballs have naming convention projectname-tagname, and tags are called cvmfs-2.XX.Y
-    cd "$srcdir/$pkgname-$pkgname-$pkgver"
+    cd "$srcdir/cvmfs-passthrough-fixes"
     mkdir -p build
     cd build
     cmake -C "${srcdir}/settings.cmake" -DCMAKE_BUILD_TYPE=Release ../
@@ -43,11 +36,11 @@ build() {
 }
 
 package() {
-    cd "$srcdir/$pkgname-$pkgname-$pkgver/build"
+    cd "$srcdir/cvmfs-passthrough-fixes/build"
     make DESTDIR="$pkgdir/" install
     sed -e "s/\/etc\/auto.master/\/etc\/autofs\/auto.master/g" -i $pkgdir/usr/bin/cvmfs_config
     sed "s/\/etc\/auto.cvmfs/\/etc\/autofs\/auto.cvmfs/g" -i $pkgdir/usr/bin/cvmfs_config
-    install -Dm644 "${srcdir}/${pkgname}-${pkgname}-${pkgver}/COPYING" "${pkgdir}/usr/share/licenses/cvmfs/COPYING"
+    install -Dm644 "${srcdir}/cvmfs-passthrough-fixes/COPYING" "${pkgdir}/usr/share/licenses/cvmfs/COPYING"
     mkdir -p ${pkgdir}/etc/autofs
     ln -s /usr/lib/${pkgname}/auto.cvmfs ${pkgdir}/etc/autofs/auto.cvmfs
 
