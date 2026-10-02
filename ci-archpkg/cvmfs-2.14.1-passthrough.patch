@@ -1,7 +1,7 @@
 From 5cfe0f8a7d019d6fc526a54ca8831c7a1777cde8 Mon Sep 17 00:00:00 2001
 From: Rohit Goswami <rohit.goswami@surf.nl>
 Date: Fri, 2 Oct 2026 16:17:58 +0200
-Subject: [PATCH 1/3] Add DropSysAdminCapability and
+Subject: [PATCH 1/4] Add DropSysAdminCapability and
  SysAdminCapabilityEffective
 
 ---
@@ -84,7 +84,7 @@ index 41e198548..174fdd11e 100644
 From 8804111d55533352fc0c7e086472dfd6916f1f1b Mon Sep 17 00:00:00 2001
 From: Rohit Goswami <rohit.goswami@surf.nl>
 Date: Fri, 2 Oct 2026 16:18:48 +0200
-Subject: [PATCH 2/3] Keep FUSE passthrough working after the capability
+Subject: [PATCH 2/4] Keep FUSE passthrough working after the capability
  reduction
 
 Since the client reduces its capabilities to the minimum (#3730), a
@@ -202,7 +202,7 @@ index 8789ccd7a..a1b9868de 100644
 From 190431c0816a7afffa2f4b6f55430d7f94ec3d36 Mon Sep 17 00:00:00 2001
 From: Rohit Goswami <rohit.goswami@surf.nl>
 Date: Fri, 2 Oct 2026 16:19:09 +0200
-Subject: [PATCH 3/3] Close FUSE passthrough backing files on release
+Subject: [PATCH 3/4] Close FUSE passthrough backing files on release
 
 libfuse rebuilds fuse_file_info for release from the release request
 (flags, fh, lock owner) and never sets backing_id, so cvmfs_release()
@@ -269,6 +269,46 @@ index a1b9868de..d21071a62 100644
      }
  #endif
    }
+-- 
+2.55.0
+
+
+From 21ecf55831a3e8bfaf6939ee6a6db92d9be67c48 Mon Sep 17 00:00:00 2001
+From: Rohit Goswami <rohit.goswami@surf.nl>
+Date: Fri, 2 Oct 2026 16:29:20 +0200
+Subject: [PATCH 4/4] capabilities: use the 2.14 assert style in
+ CheckCapabilityEffective
+
+---
+ cvmfs/util/capabilities.cc | 9 ++-------
+ 1 file changed, 2 insertions(+), 7 deletions(-)
+
+diff --git a/cvmfs/util/capabilities.cc b/cvmfs/util/capabilities.cc
+index 19424f980..d4906c69d 100644
+--- a/cvmfs/util/capabilities.cc
++++ b/cvmfs/util/capabilities.cc
+@@ -297,19 +297,14 @@ bool CheckCapabilityPermitted(const cap_value_t cap) {
+ 
+ bool CheckCapabilityEffective(const cap_value_t cap) {
+   cap_t caps_proc = cap_get_proc();
+-  if (caps_proc == NULL)
+-    PANIC(kLogSyslogErr | kLogDebug,
+-          "Cannot get process capabilities (errno: %d)", errno);
++  assert(caps_proc != NULL);
+   cap_flag_value_t cap_state;
+   const int retval = cap_get_flag(caps_proc,
+                                   cap,
+                                   CAP_EFFECTIVE,
+                                   &cap_state);
++  assert(retval == 0);
+   cap_free(caps_proc);
+-  if (retval != 0)
+-    PANIC(kLogSyslogErr | kLogDebug,
+-          "Cannot inspect effective capability 0x%x (errno: %d)", cap,
+-          errno);
+   return (cap_state == CAP_SET);
+ }
+ 
 -- 
 2.55.0
 

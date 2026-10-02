@@ -22,7 +22,7 @@ source=("https://github.com/cvmfs/cvmfs/archive/refs/tags/$pkgname-$pkgver.tar.g
        )
 md5sums=('f2fe8673a4b05e2e931a780fa9254525'
          '4e7a9a38b3cb0fc95d83fa0456071f2b'
-         '7b4614b498bc11d2f73e9db560647c41')
+         '9ec6ab71fd83e419a490f07d0679c149')
 
 prepare() {
     #Temporary pull patch for a race condition occasionally
