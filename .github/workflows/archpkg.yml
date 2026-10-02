@@ -47,7 +47,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: passthrough-fixes
+          ref: passthrough-broker
       - name: dependencies
         run: pacman -Syu --noconfirm --needed base-devel git fuse3 fuse2 curl c-ares pacparser sqlite leveldb cmake gtest sparsehash help2man python libcap util-linux-libs openssl zlib attr
       - name: configure and build the client
@@ -61,14 +61,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tree: [fix-fuse-passthrough-fallback, devel-with-new-tests]
+        tree: [passthrough-broker]
     steps:
       - name: dependencies
         run: pacman -Syu --noconfirm --needed base-devel git fuse3 fuse2 curl c-ares pacparser sqlite leveldb cmake gtest sparsehash help2man python libcap util-linux-libs openssl zlib attr protobuf
       - name: source
         run: |
           git clone -q https://github.com/HaoZeke/cvmfs.git src
-          cd src && git fetch -q https://github.com/cvmfs/cvmfs.git devel && git checkout -q origin/fix-fuse-passthrough-fallback
+          cd src && git fetch -q https://github.com/cvmfs/cvmfs.git devel && git checkout -q origin/passthrough-broker
           if [ "${{ matrix.tree }}" = devel-with-new-tests ]; then
             # stock devel code, this branch's tests and libfuse stubs
             git checkout -q FETCH_HEAD -- cvmfs
