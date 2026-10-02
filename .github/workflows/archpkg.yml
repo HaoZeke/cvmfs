@@ -72,7 +72,7 @@ jobs:
           if [ "${{ matrix.tree }}" = devel-with-new-tests ]; then
             # stock devel code, this branch's tests and libfuse stubs
             git checkout -q FETCH_HEAD -- cvmfs
-            sed -i '/cvmfs::fuse_passthru_refused = false;/d' test/unittests/t_cvmfs.cc
+            sed -i '/cvmfs::fuse_passthru_refused/d' test/unittests/t_cvmfs.cc
           fi
           git log --oneline -1
       - name: build the mockfuse unit tests
