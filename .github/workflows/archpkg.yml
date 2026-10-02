@@ -61,14 +61,14 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        tree: [passthrough-fixes, devel-with-new-tests]
+        tree: [fix-fuse-passthrough-fallback, devel-with-new-tests]
     steps:
       - name: dependencies
         run: pacman -Syu --noconfirm --needed base-devel git fuse3 fuse2 curl c-ares pacparser sqlite leveldb cmake gtest sparsehash help2man python libcap util-linux-libs openssl zlib attr protobuf
       - name: source
         run: |
           git clone -q https://github.com/HaoZeke/cvmfs.git src
-          cd src && git fetch -q https://github.com/cvmfs/cvmfs.git devel && git checkout -q origin/passthrough-fixes
+          cd src && git fetch -q https://github.com/cvmfs/cvmfs.git devel && git checkout -q origin/fix-fuse-passthrough-fallback
           if [ "${{ matrix.tree }}" = devel-with-new-tests ]; then
             # stock devel code, this branch's tests and libfuse stubs
             git checkout -q FETCH_HEAD -- cvmfs
@@ -85,7 +85,7 @@ jobs:
           cd src/build
           set +e
           ./test/unittests/cvmfs_unittests_mockfuse --gtest_filter='T_Cvmfs.*' 2>&1 | tail -5
-          for t in RefusedBackingOpenServesWithoutPassthrough ReleaseClosesBackingFileOnLastReference; do
+          for t in RefusedBackingOpenServesWithoutPassthrough OtherBackingOpenFailureKeepsPassthroughOn ReleaseClosesBackingFileOnLastReference; do
             echo "=== T_CvmfsPassthrough.$t"
             ./test/unittests/cvmfs_unittests_mockfuse --gtest_filter="T_CvmfsPassthrough.$t" 2>&1 | grep -E 'OK \]|FAILED|Failure|Expected|Which is|actual|Assertion|Aborted' | head -12
             echo "exit ${PIPESTATUS[0]}"
