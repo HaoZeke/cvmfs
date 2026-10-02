@@ -22,7 +22,7 @@ jobs:
           path: src-fixes
       - name: toolchain and dependencies
         run: |
-          pacman -Syu --noconfirm --needed base-devel git fuse3 fuse2 curl c-ares pacparser sqlite leveldb cmake gtest sparsehash help2man python protobuf libcap util-linux-libs openssl zlib attr valgrind
+          pacman -Syu --noconfirm --needed base-devel git fuse3 fuse2 curl c-ares pacparser sqlite leveldb cmake gtest sparsehash help2man python libcap util-linux-libs openssl zlib attr valgrind
           useradd -m builder
           cp -r ci-archpkg /home/builder/pkg
           mv src-fixes cvmfs-passthrough-fixes && tar czf /home/builder/pkg/cvmfs-passthrough-fixes.tar.gz cvmfs-passthrough-fixes
@@ -32,6 +32,7 @@ jobs:
           cd /home/builder/pkg
           su builder -c "MAKEFLAGS=-j$(nproc) makepkg -f --noconfirm --nodeps" 2>&1 | tail -60
           ls -la *.pkg.tar.zst
+          for f in src/cvmfs-passthrough-fixes/build/cvmfs/libcvmfs_fuse3.so; do ldd "$f" | grep -i proto || echo "no shared protobuf"; done
           pacman -Q curl fuse3 > versions.txt
       - uses: actions/upload-artifact@v4
         with:
@@ -48,7 +49,7 @@ jobs:
         with:
           ref: passthrough-fixes
       - name: dependencies
-        run: pacman -Syu --noconfirm --needed base-devel git fuse3 fuse2 curl c-ares pacparser sqlite leveldb cmake gtest sparsehash help2man python protobuf libcap util-linux-libs openssl zlib attr
+        run: pacman -Syu --noconfirm --needed base-devel git fuse3 fuse2 curl c-ares pacparser sqlite leveldb cmake gtest sparsehash help2man python libcap util-linux-libs openssl zlib attr
       - name: configure and build the client
         run: |
           cmake -S . -B build -DBUILD_SERVER=OFF -DBUILD_RECEIVER=OFF -DBUILD_LIBCVMFS=OFF -DBUILD_LIBCVMFS_CACHE=OFF -DBUILD_SHRINKWRAP=OFF -DBUILD_GATEWAY=OFF -DBUILD_DUCC=OFF -DBUILD_SNAPSHOTTER=OFF -DBUILD_UNITTESTS=OFF -DBUILTIN_EXTERNALS_LIST="libcrypto"
