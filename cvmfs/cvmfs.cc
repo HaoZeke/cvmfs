@@ -1378,15 +1378,36 @@ static void cvmfs_open(fuse_req_t req, fuse_ino_t ino,
           pthread_mutex_lock(&fuse_passthru_tracker_lock);
           auto iter = fuse_passthru_tracker->find(ino);
           if (iter == fuse_passthru_tracker->end()) {
-            auto pair_with_iterator = fuse_passthru_tracker->emplace(ino, fuse_passthru_ctx_t());
-            assert(pair_with_iterator.second == true);
-            iter = pair_with_iterator.first;
-            fuse_passthru_ctx_t &entry = iter->second;
-
-            backing_id = fuse_passthrough_open(req, fd);
-            assert(backing_id != 0);
-            entry.backing_id = backing_id;
-            entry.refcount++;
+            /* The kernel hands out backing files only to a daemon with
+             * CAP_SYS_ADMIN; it is reserved for this at start-up and raised
+             * here for the calling thread only. Without it (an unprivileged
+             * mount) fuse_passthrough_open() returns 0, and the file is
+             * served through the regular read path. After the first refusal
+             * no further backing files are requested. Guarded by
+             * fuse_passthru_tracker_lock. */
+            static bool passthrough_refused = false;
+            backing_id = 0;
+            if (!passthrough_refused) {
+              const bool raise = !SysAdminCapabilityEffective();
+              if (raise)
+                ObtainSysAdminCapability();
+              backing_id = fuse_passthrough_open(req, fd);
+              if (raise)
+                DropSysAdminCapability();
+            }
+            if (backing_id > 0) {
+              auto pair_with_iterator = fuse_passthru_tracker->emplace(
+                  ino, fuse_passthru_ctx_t());
+              assert(pair_with_iterator.second == true);
+              fuse_passthru_ctx_t &entry = pair_with_iterator.first->second;
+              entry.backing_id = backing_id;
+              entry.refcount++;
+            } else if (!passthrough_refused) {
+              passthrough_refused = true;
+              LogCvmfs(kLogCvmfs, kLogDebug | kLogSyslogWarn,
+                       "FUSE: passthrough_open failed, serving files without "
+                       "passthrough (the kernel requires CAP_SYS_ADMIN)");
+            }
           } else {
             fuse_passthru_ctx_t &entry = iter->second;
             assert(entry.refcount > 0);
@@ -1395,11 +1416,12 @@ static void cvmfs_open(fuse_req_t req, fuse_ino_t ino,
           }
           pthread_mutex_unlock(&fuse_passthru_tracker_lock);
 
-          fi->backing_id = backing_id;
-
-          /* according to libfuse example/passthrough_hp.cc:
-           * "open in passthrough mode must drop old page cache" */
-          fi->keep_cache = false;
+          if (backing_id > 0) {
+            fi->backing_id = backing_id;
+            /* according to libfuse example/passthrough_hp.cc:
+             * "open in passthrough mode must drop old page cache" */
+            fi->keep_cache = false;
+          }
         }
       }
 #endif
@@ -2634,10 +2656,21 @@ static void Spawn() {
     // Earlier switched to using elevated capabilities without real uid root,
     // now reduce to minimum capabilities.
     const std::vector<cap_value_t> nocaps;
+    std::vector<cap_value_t> reservecaps;
     if (NeedsReadEnviron()) {
       // Reserve the capabilities to read process environments
-      const std::vector<cap_value_t> reservecaps = {CAP_DAC_READ_SEARCH, CAP_SYS_PTRACE};
-      assert(ClearPermittedCapabilities(reservecaps, nocaps));
+      reservecaps.push_back(CAP_DAC_READ_SEARCH);
+      reservecaps.push_back(CAP_SYS_PTRACE);
+    }
+    if (loader_exports_ && loader_exports_->fuse_passthrough) {
+      // The kernel opens FUSE passthrough backing files only for a daemon
+      // with CAP_SYS_ADMIN (FUSE_DEV_IOC_BACKING_OPEN and _CLOSE)
+      reservecaps.push_back(CAP_SYS_ADMIN);
+    }
+    if (!reservecaps.empty()) {
+      if (!ClearPermittedCapabilities(reservecaps, nocaps))
+        PANIC(kLogStderr | kLogSyslogErr,
+              "Failed to reduce process capabilities");
     } else {
       assert(ClearPermittedCapabilities(nocaps, nocaps));
     }
