@@ -13,10 +13,14 @@
 
 #include <errno.h>
 #include <execinfo.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <pthread.h>
 #include <signal.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #ifdef __APPLE__
 #include <sys/ucontext.h>
@@ -28,6 +32,12 @@
 #include <syslog.h>
 #include <time.h>
 #include <unistd.h>
+#if defined(__linux__) && defined(__has_include)
+#if __has_include(<linux/fuse.h>)
+#include <linux/fuse.h>
+#include <sys/ioctl.h>
+#endif
+#endif
 
 #include <cassert>
 #include <cstdio>
@@ -66,13 +76,14 @@ int Watchdog::g_crash_signals[] = {SIGQUIT, SIGILL, SIGABRT, SIGFPE,
 
 Watchdog *Watchdog::Create(FnOnExit on_exit,
                            bool needs_read_environ,
-                           WatchdogState *saved_state) {
+                           WatchdogState *saved_state,
+                           bool passthrough_broker) {
   assert(instance_ == NULL);
   instance_ = new Watchdog(on_exit);
   if (saved_state != NULL)
     instance_->RestoreState(saved_state);
   else
-    instance_->Fork(needs_read_environ);
+    instance_->Fork(needs_read_environ, passthrough_broker);
   return instance_;
 }
 
@@ -390,8 +401,30 @@ Watchdog::SigactionMap Watchdog::SetSignalHandlers(
 /**
  * Fork the watchdog process and put it on hold until Spawn() is called.
  */
-void Watchdog::Fork(bool needs_read_environ) {
+void Watchdog::Fork(bool needs_read_environ, bool passthrough_broker) {
   Pipe<kPipeWatchdogPid> pipe_pid;
+#ifdef FUSE_DEV_IOC_BACKING_OPEN
+  // Only the watchdog of the FUSE module (the one that unmounts) keeps
+  // CAP_SYS_ADMIN, so only it can broker passthrough backing files.
+  if (passthrough_broker && on_exit_) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0, sv) == 0) {
+      broker_fd_ = sv[0];
+      broker_peer_fd_ = sv[1];
+      // A stopped watchdog must not hang the client's opens.
+      struct timeval timeout = {2, 0};
+      setsockopt(broker_fd_, SOL_SOCKET, SO_RCVTIMEO, &timeout,
+                 sizeof(timeout));
+      setsockopt(broker_fd_, SOL_SOCKET, SO_SNDTIMEO, &timeout,
+                 sizeof(timeout));
+    } else {
+      LogCvmfs(kLogMonitor, kLogDebug | kLogSyslogWarn,
+               "no passthrough broker, socketpair failed (%d)", errno);
+    }
+  }
+#else
+  (void)passthrough_broker;
+#endif
   pipe_watchdog_ = std::unique_ptr<Pipe<kPipeWatchdog> >(
       new Pipe<kPipeWatchdog>());
   pipe_listener_ = std::unique_ptr<Pipe<kPipeWatchdogSupervisor> >(
@@ -409,6 +442,10 @@ void Watchdog::Fork(bool needs_read_environ) {
           _exit(1);
         case 0: {
           pipe_watchdog_->CloseWriteFd();
+          if (broker_fd_ >= 0) {
+            close(broker_fd_);
+            broker_fd_ = -1;
+          }
           Daemonize();
           if ((geteuid() != 0) && SetuidCapabilityPermitted()) {
             const std::vector<cap_value_t> nocaps;
@@ -465,9 +502,22 @@ void Watchdog::Fork(bool needs_read_environ) {
           preserve_fds.insert(2);
           preserve_fds.insert(pipe_watchdog_->GetReadFd());
           preserve_fds.insert(pipe_listener_->GetWriteFd());
+          if (broker_peer_fd_ >= 0)
+            preserve_fds.insert(broker_peer_fd_);
           CloseAllFildes(preserve_fds);
           SetLogMicroSyslog(usyslog_save);  // no-op if usyslog not used
           SetLogDebugFile(debuglog_save);   // no-op if debug log not used
+
+          if (broker_peer_fd_ >= 0) {
+            pthread_t thread_broker;
+            if (pthread_create(&thread_broker, NULL, MainBackingBroker, this)
+                == 0) {
+              pthread_detach(thread_broker);
+            } else {
+              close(broker_peer_fd_);
+              broker_peer_fd_ = -1;
+            }
+          }
 
           if (WaitForSupervisee())
             Supervise();
@@ -483,6 +533,10 @@ void Watchdog::Fork(bool needs_read_environ) {
       pipe_watchdog_->CloseReadFd();
       pipe_listener_->CloseWriteFd();
       pipe_pid.CloseWriteFd();
+      if (broker_peer_fd_ >= 0) {
+        close(broker_peer_fd_);
+        broker_peer_fd_ = -1;
+      }
       if (waitpid(pid, &statloc, 0) != pid)
         PANIC(NULL);
       if (!WIFEXITED(statloc) || WEXITSTATUS(statloc))
@@ -699,6 +753,7 @@ void Watchdog::SaveState(WatchdogState *saved_state) {
     saved_state->watchdog_write_fd = pipe_watchdog_->GetWriteFd();
     saved_state->listener_read_fd = pipe_listener_->GetReadFd();
   }
+  saved_state->broker_fd = broker_fd_;
 }
 
 
@@ -707,6 +762,8 @@ void Watchdog::SaveState(WatchdogState *saved_state) {
  */
 void Watchdog::RestoreState(WatchdogState *saved_state) {
   watchdog_pid_ = saved_state->pid;
+  if (saved_state->version >= 1)
+    broker_fd_ = saved_state->broker_fd;
   if (!saved_state->spawned) {
     return;
   }
@@ -718,11 +775,234 @@ void Watchdog::RestoreState(WatchdogState *saved_state) {
 }
 
 
+#ifdef FUSE_DEV_IOC_BACKING_OPEN
+namespace {
+
+struct BrokerRequest {
+  int32_t op;
+  int32_t arg;
+};
+
+/**
+ * Sends one broker message, with fd attached as SCM_RIGHTS when fd >= 0.
+ * SendFd2Socket() and RecvFdFromSocket() carry no payload, and the latter
+ * asserts on what the peer sends, which a client must not be able to trigger
+ * in the watchdog.
+ */
+bool BrokerSend(int sock, const void *buf, size_t size, int fd) {
+  struct iovec iov;
+  iov.iov_base = const_cast<void *>(buf);
+  iov.iov_len = size;
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  union {
+    struct cmsghdr align;
+    unsigned char buf[CMSG_SPACE(sizeof(int))];
+  } ctrl;
+  if (fd >= 0) {
+    memset(ctrl.buf, 0, sizeof(ctrl.buf));
+    msg.msg_control = ctrl.buf;
+    msg.msg_controllen = sizeof(ctrl.buf);
+    struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg);
+    cmsg->cmsg_level = SOL_SOCKET;
+    cmsg->cmsg_type = SCM_RIGHTS;
+    cmsg->cmsg_len = CMSG_LEN(sizeof(int));
+    memcpy(CMSG_DATA(cmsg), &fd, sizeof(int));
+  }
+  ssize_t n;
+  do {
+    n = sendmsg(sock, &msg, MSG_NOSIGNAL);
+  } while ((n < 0) && (errno == EINTR));
+  return n == static_cast<ssize_t>(size);
+}
+
+/**
+ * Receives one broker message of exactly size bytes; *fd is the attached
+ * descriptor or -1.  Returns size, 0 when the peer closed, or -errno; a
+ * message of another size or with truncated ancillary data is -EINVAL.
+ */
+ssize_t BrokerRecv(int sock, void *buf, size_t size, int *fd) {
+  *fd = -1;
+  struct iovec iov;
+  iov.iov_base = buf;
+  iov.iov_len = size;
+  struct msghdr msg;
+  memset(&msg, 0, sizeof(msg));
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  union {
+    struct cmsghdr align;
+    unsigned char buf[CMSG_SPACE(sizeof(int))];
+  } ctrl;
+  msg.msg_control = ctrl.buf;
+  msg.msg_controllen = sizeof(ctrl.buf);
+  ssize_t n;
+  do {
+    n = recvmsg(sock, &msg, MSG_CMSG_CLOEXEC);
+  } while ((n < 0) && (errno == EINTR));
+  if (n < 0)
+    return -errno;
+  for (struct cmsghdr *cmsg = CMSG_FIRSTHDR(&msg); cmsg != NULL;
+       cmsg = CMSG_NXTHDR(&msg, cmsg))
+  {
+    if ((cmsg->cmsg_level == SOL_SOCKET) && (cmsg->cmsg_type == SCM_RIGHTS)
+        && (cmsg->cmsg_len == CMSG_LEN(sizeof(int))))
+    {
+      memcpy(fd, CMSG_DATA(cmsg), sizeof(int));
+    }
+  }
+  if ((n > 0) && ((n != static_cast<ssize_t>(size))
+                  || (msg.msg_flags & (MSG_TRUNC | MSG_CTRUNC))))
+  {
+    return -EINVAL;
+  }
+  return n;
+}
+
+int32_t BrokerBackingOpen(int fuse_fd, int fd) {
+  if (fuse_fd < 0)
+    return -ENODEV;
+  platform_stat64 info;
+  if ((fd < 0) || (platform_fstat(fd, &info) != 0))
+    return -EBADF;
+  if (!S_ISREG(info.st_mode))
+    return -EINVAL;
+  // The kernel reopens the backing file with the broker's credentials and
+  // the reader's flags, so only a file the client could read is accepted.
+  const int flags = fcntl(fd, F_GETFL);
+  if ((flags < 0) || ((flags & O_ACCMODE) != O_RDONLY))
+    return -EACCES;
+  struct fuse_backing_map map;
+  memset(&map, 0, sizeof(map));
+  map.fd = fd;
+  const int retval = ioctl(fuse_fd, FUSE_DEV_IOC_BACKING_OPEN, &map);
+  return (retval > 0) ? retval : -errno;
+}
+
+int32_t BrokerBackingClose(int fuse_fd, int32_t backing_id) {
+  if (fuse_fd < 0)
+    return -ENODEV;
+  uint32_t id = static_cast<uint32_t>(backing_id);
+  const int retval = ioctl(fuse_fd, FUSE_DEV_IOC_BACKING_CLOSE, &id);
+  return (retval == 0) ? 0 : -errno;
+}
+
+}  // anonymous namespace
+
+
+namespace backing_broker {
+
+int Call(int sock, int op, int arg, int fd) {
+  BrokerRequest request;
+  request.op = op;
+  request.arg = arg;
+  if (!BrokerSend(sock, &request, sizeof(request), fd))
+    return -errno;
+  int32_t reply;
+  int unused_fd;
+  const ssize_t n = BrokerRecv(sock, &reply, sizeof(reply), &unused_fd);
+  if (unused_fd >= 0)
+    close(unused_fd);
+  if (n < 0)
+    return static_cast<int>(n);
+  if (n == 0)
+    return -EPIPE;
+  return reply;
+}
+
+void Serve(int sock) {
+  // Capabilities are per thread: the broker thread holds CAP_SYS_ADMIN
+  // effective for good, the rest of the watchdog keeps it only permitted.
+  // Without it the kernel answers the ioctls with EPERM.
+  if (!ObtainSysAdminCapability()) {
+    LogCvmfs(kLogMonitor, kLogDebug,
+             "passthrough broker runs without CAP_SYS_ADMIN");
+  }
+  int fuse_fd = -1;
+  while (true) {
+    BrokerRequest request;
+    int fd;
+    const ssize_t n = BrokerRecv(sock, &request, sizeof(request), &fd);
+    if ((n == 0) || ((n < 0) && (n != -EINVAL)))
+      break;
+    int32_t reply = -EINVAL;
+    if (n > 0) {
+      switch (request.op) {
+        case kSetFuseDevice:
+          if (fd < 0) {
+            reply = -EBADF;
+          } else {
+            if (fuse_fd >= 0)
+              close(fuse_fd);
+            fuse_fd = fd;
+            fd = -1;
+            reply = 0;
+          }
+          break;
+        case kBackingOpen:
+          reply = BrokerBackingOpen(fuse_fd, fd);
+          break;
+        case kBackingClose:
+          reply = BrokerBackingClose(fuse_fd, request.arg);
+          break;
+        default:
+          break;
+      }
+    }
+    if (fd >= 0)
+      close(fd);
+    BrokerSend(sock, &reply, sizeof(reply), -1);
+  }
+  if (fuse_fd >= 0)
+    close(fuse_fd);
+}
+
+}  // namespace backing_broker
+
+
+int Watchdog::BrokerSetFuseDevice(int fuse_fd) {
+  if (broker_fd_ < 0)
+    return -ENOSYS;
+  return backing_broker::Call(broker_fd_, backing_broker::kSetFuseDevice, 0,
+                              fuse_fd);
+}
+
+int Watchdog::BrokerBackingOpen(int fd) {
+  if (broker_fd_ < 0)
+    return -ENOSYS;
+  return backing_broker::Call(broker_fd_, backing_broker::kBackingOpen, 0, fd);
+}
+
+int Watchdog::BrokerBackingClose(int backing_id) {
+  if (broker_fd_ < 0)
+    return -ENOSYS;
+  return backing_broker::Call(broker_fd_, backing_broker::kBackingClose,
+                              backing_id, -1);
+}
+
+void *Watchdog::MainBackingBroker(void *data) {
+  Watchdog *watchdog = static_cast<Watchdog *>(data);
+  backing_broker::Serve(watchdog->broker_peer_fd_);
+  close(watchdog->broker_peer_fd_);
+  return NULL;
+}
+#else
+int Watchdog::BrokerSetFuseDevice(int) { return -ENOSYS; }
+int Watchdog::BrokerBackingOpen(int) { return -ENOSYS; }
+int Watchdog::BrokerBackingClose(int) { return -ENOSYS; }
+void *Watchdog::MainBackingBroker(void *) { return NULL; }
+#endif
+
+
 Watchdog::Watchdog(FnOnExit on_exit)
     : spawned_(false)
     , maintenance_mode_(false)
     , exe_path_(string(platform_getexepath()))
     , watchdog_pid_(0)
+    , broker_fd_(-1)
+    , broker_peer_fd_(-1)
     , on_exit_(on_exit) {
   const int retval = platform_spinlock_init(&lock_handler_, 0);
   assert(retval == 0);
@@ -759,6 +1039,8 @@ Watchdog::~Watchdog() {
     }
     pipe_watchdog_->CloseWriteFd();
     pipe_listener_->CloseReadFd();
+    if (broker_fd_ >= 0)
+      close(broker_fd_);
   } else {
     // Release the references to the watchdog pipes without closing them
     pipe_watchdog_.release();
